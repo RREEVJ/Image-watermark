@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Invisible Watermark</title>
+<style>
+  :root{--bg:#0f1115;--card:#181b22;--fg:#e6e8ee;--mut:#8b91a1;--acc:#5b9cff;--ok:#4cd39b;--bad:#ff6b6b}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,sans-serif;padding:20px}
+  main{max-width:900px;margin:auto}
+  h1{font-size:22px;margin:0 0 4px}
+  p.sub{color:var(--mut);margin:0 0 20px}
+  .card{background:var(--card);border-radius:12px;padding:16px;margin-bottom:16px}
+  label{display:block;color:var(--mut);font-size:13px;margin:10px 0 4px}
+  input[type=text],input[type=password],textarea{width:100%;background:#0f1115;border:1px solid #2a2f3a;color:var(--fg);border-radius:8px;padding:9px;font:inherit}
+  textarea{min-height:70px;resize:vertical}
+  .row{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}
+  button{background:var(--acc);color:#fff;border:0;border-radius:8px;padding:9px 16px;font:inherit;cursor:pointer}
+  button.alt{background:#2a2f3a}
+  button:disabled{opacity:.4;cursor:not-allowed}
+  #drop{border:2px dashed #2a2f3a;border-radius:12px;padding:28px;text-align:center;color:var(--mut);cursor:pointer}
+  #drop.over{border-color:var(--acc);color:var(--fg)}
+  canvas{max-width:100%;border-radius:8px;display:block;margin-top:12px;background:#000}
+  #status{margin-top:12px;min-height:1.4em}
+  .ok{color:var(--ok)}.bad{color:var(--bad)}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  @media(max-width:640px){.grid{grid-template-columns:1fr}}
+  small{color:var(--mut)}
+</style>
+</head>
+<body>
+<main>
+  <h1>Invisible Watermark</h1>
+  <p class="sub">Hide text in pixel LSBs. Change per channel: max 1 of 255. Read back with same key.</p>
+
+  <div class="card">
+    <div id="drop">Drop image here or click to pick</div>
+    <input id="file" type="file" accept="image/*" hidden>
+    <div id="info"><small></small></div>
+  </div>
+
+  <div class="card">
+    <label for="msg">Message</label>
+    <textarea id="msg" placeholder="(c) me 2026 - id 8841"></textarea>
+    <label for="key">Key (optional - scatters bits, needed to extract)</label>
+    <input id="key" type="password" placeholder="secret">
+    <div class="row">
+      <button id="embed" disabled>Embed + download PNG</button>
+      <button id="extract" class="alt" disabled>Extract message</button>
+      <button id="reveal" class="alt" disabled>Show LSB map</button>
+      <button id="orig" class="alt" disabled>Show image</button>
+    </div>
+    <div id="status"></div>
+    <div id="out" style="margin-top:12px"></div>
+  </div>
+
+  <div class="card">
+    <canvas id="cv" width="1" height="1"></canvas>
+  </div>
+
+  <div class="card">
+    <small>
+      Output must stay PNG (lossless). JPEG save, resize, crop, screenshot, or social-site recompress destroys mark.
+      Transparent pixels become opaque on embed. LSB map shows what a machine sees: noise where bits sit.
+    </small>
+  </div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const cv = $('cv'), ctx = cv.getContext('2d', {willReadFrequently:true});
+let fileName = 'image';
+let loaded = false;
+let base = null; // pixel data of current image (original or marked), never the LSB map
+
+function hash(s){let h=1779033703^s.length;for(let i=0;i<s.length;i++){h=Math.imul(h^s.charCodeAt(i),3432918353);h=h<<13|h>>>19}return h>>>0}
+function rng(seed){return()=>{seed|=0;seed=seed+0x6D2B79F5|0;let t=Math.imul(seed^seed>>>15,1|seed);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296}}
+
+// Permutation of channel slots. Slot s -> byte index in RGBA array (alpha skipped).
+function slotOrder(n, key){
+  const a = new Uint32Array(n);
+  for(let i=0;i<n;i++) a[i]=i;
+  if(key){
+    const r = rng(hash(key));
+    for(let i=n-1;i>0;i--){
+      const j = Math.floor(r()*(i+1));
+      const t=a[i]; a[i]=a[j]; a[j]=t;
+    }
+  }
+  return a;
+}
+const px = s => ((s/3)|0)*4 + (s%3);
+
+const MAGIC = [0xA5, 0x57];
+const HEADER = 7; // magic(2) + len(4) + crc(1)
+
+function crc(bytes){let c=0;for(const b of bytes){c=((c<<1)|(c>>>7))&255;c^=b}return c}
+
+function status(t, cls=''){ $('status').className = cls; $('status').textContent = t; }
+
+function ready(w, h, draw){
+  cv.width = w; cv.height = h;
+  draw();
+  base = ctx.getImageData(0,0,w,h);
+  loaded = true;
+  ['embed','extract','reveal','orig'].forEach(id => $(id).disabled = false);
+  const cap = Math.floor(w*h*3/8) - HEADER;
+  $('info').firstChild.textContent = `${w}x${h} - capacity ~${Math.max(cap,0)} bytes`;
+  status('');
+}
+
+async function loadFile(f){
+  if(!f) return;
+  fileName = f.name.replace(/\.[^.]+$/, '');
+  status('Loading...');
+  // Try 1: createImageBitmap (handles more cases, ignores EXIF rotation off)
+  try{
+    const bmp = await createImageBitmap(f);
+    return ready(bmp.width, bmp.height, () => ctx.drawImage(bmp, 0, 0));
+  }catch(e){}
+  // Try 2: <img> via data URL
+  try{
+    const url = await new Promise((res, rej) => {
+      const r = new FileReader();
+      r.onload = () => res(r.result);
+      r.onerror = () => rej(r.error);
+      r.readAsDataURL(f);
+    });
+    const img = await new Promise((res, rej) => {
+      const i = new Image();
+      i.onload = () => res(i);
+      i.onerror = () => rej(new Error('decode'));
+      i.src = url;
+    });
+    return ready(img.naturalWidth, img.naturalHeight, () => ctx.drawImage(img, 0, 0));
+  }catch(e){
+    const t = f.type || f.name.split('.').pop();
+    status(`Browser cannot decode this file (${t}, ${(f.size/1048576).toFixed(1)} MB). HEIC/HEIF/RAW unsupported in most browsers - convert to PNG or JPG first.`, 'bad');
+  }
+}
+
+$('drop').onclick = () => $('file').click();
+$('file').onchange = e => loadFile(e.target.files[0]);
+$('drop').ondragover = e => { e.preventDefault(); $('drop').classList.add('over'); };
+$('drop').ondragleave = () => $('drop').classList.remove('over');
+$('drop').ondrop = e => { e.preventDefault(); $('drop').classList.remove('over'); loadFile(e.dataTransfer.files[0]); };
+
+$('embed').onclick = () => {
+  const msg = $('msg').value;
+  if(!msg) return status('Enter message.', 'bad');
+  const payload = new TextEncoder().encode(msg);
+  const n = cv.width*cv.height*3;
+  const need = (HEADER+payload.length)*8;
+  if(need > n) return status(`Too big: need ${need} bits, have ${n}.`, 'bad');
+
+  const bytes = new Uint8Array(HEADER+payload.length);
+  bytes[0]=MAGIC[0]; bytes[1]=MAGIC[1];
+  new DataView(bytes.buffer).setUint32(2, payload.length);
+  bytes[6]=crc(payload);
+  bytes.set(payload, HEADER);
+
+  const im = new ImageData(new Uint8ClampedArray(base.data), base.width, base.height);
+  const d = im.data;
+  for(let i=3;i<d.length;i+=4) d[i]=255;
+  const order = slotOrder(n, $('key').value);
+  for(let i=0;i<need;i++){
+    const bit = (bytes[i>>3] >> (7-(i&7))) & 1;
+    const k = px(order[i]);
+    d[k] = (d[k] & 0xFE) | bit;
+  }
+  ctx.putImageData(im,0,0);
+  base = im;
+  cv.toBlob(b => {
+    if(!b) return status('PNG export failed (image too large for browser?).', 'bad');
+    if(lastUrl) URL.revokeObjectURL(lastUrl);
+    lastUrl = URL.createObjectURL(b);
+    const name = fileName + '-marked.png';
+    const out = $('out');
+    out.innerHTML = '';
+    const a = document.createElement('a');
+    a.href = lastUrl; a.download = name;
+    a.textContent = 'Download ' + name;
+    a.style.cssText = 'display:inline-block;background:#4cd39b;color:#0f1115;padding:9px 16px;border-radius:8px;text-decoration:none;font-weight:600';
+    const img = document.createElement('img');
+    img.src = lastUrl; img.alt = name;
+    img.style.cssText = 'max-width:100%;display:block;margin-top:12px;border-radius:8px';
+    const hint = document.createElement('small');
+    hint.textContent = 'Link not working? Right-click image (desktop) or long-press (mobile) and choose Save Image.';
+    hint.style.display = 'block'; hint.style.marginTop = '8px';
+    out.append(a, img, hint);
+    a.click(); // auto-start download; visible link stays for retry
+    status(`Embedded ${payload.length} bytes. File: ${name}`, 'ok');
+  }, 'image/png');
+};
+let lastUrl = null;
+
+function readBits(d, order, startBit, count){
+  const out = new Uint8Array(Math.ceil(count/8));
+  for(let i=0;i<count;i++){
+    const bit = d[px(order[startBit+i])] & 1;
+    out[i>>3] |= bit << (7-(i&7));
+  }
+  return out;
+}
+
+$('extract').onclick = () => {
+  const n = cv.width*cv.height*3;
+  if(n < HEADER*8) return status('Image too small.', 'bad');
+  const d = base.data;
+  const order = slotOrder(n, $('key').value);
+  const h = readBits(d, order, 0, HEADER*8);
+  if(h[0]!==MAGIC[0] || h[1]!==MAGIC[1]) return status('No watermark found (or wrong key).', 'bad');
+  const len = new DataView(h.buffer).getUint32(2);
+  if((HEADER+len)*8 > n) return status('Header corrupt.', 'bad');
+  const all = readBits(d, order, 0, (HEADER+len)*8);
+  const payload = all.slice(HEADER);
+  if(crc(payload) !== all[6]) return status('Checksum fail - data damaged.', 'bad');
+  const text = new TextDecoder().decode(payload);
+  status('Found: ' + text, 'ok');
+};
+
+$('reveal').onclick = () => {
+  const im = new ImageData(new Uint8ClampedArray(base.data), base.width, base.height);
+  const d = im.data;
+  for(let i=0;i<d.length;i+=4){
+    d[i]=(d[i]&1)*255; d[i+1]=(d[i+1]&1)*255; d[i+2]=(d[i+2]&1)*255; d[i+3]=255;
+  }
+  ctx.putImageData(im,0,0);
+  status('LSB map shown. Click "Show image" to go back.');
+};
+
+$('orig').onclick = () => {
+  ctx.putImageData(base,0,0);
+  status('Image view restored.');
+};
+</script>
+</body>
+</html>
